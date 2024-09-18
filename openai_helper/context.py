@@ -68,22 +68,52 @@ class ContextProvider:
                 if self.allow_hidden_subdirectories or not path.name.startswith("."):
                     yield from self.iter_file_paths(path)
 
-    def iter_files(self, top: Path | None = None) -> Generator[tuple[int, Path, str], None, None]:
-        """Iterate over all matching files from the directory tree. It yields tuples
-        of (lenght in tokens, path, file content)"""
-        encoding = tiktoken.encoding_for_model("gpt-4")
+    def iter_files(self, top: Path | None = None, chunk_size: int = 1024, token_limit: int = 10000) -> Generator[tuple[int, Path, str], None, None]:
+        """Iterate over all matching files from the directory tree in chunks.
+        It yields tuples of (length in tokens, path, file content), and stops if token limit is exceeded."""
+        
+        encoding = tiktoken.encoding_for_model("gpt-4")  # Assume tiktoken is used for tokenizing
+        total_tokens = 0  # Track total tokens across files
+        
         for path in self.iter_file_paths(top):
             try:
-                content = path.read_text().strip()
+                with open(path, 'r', encoding='utf-8', errors='ignore') as file:
+                    file_content = ""
+                    file_tokens = 0
+                    
+                    while True:
+                        chunk = file.read(chunk_size)  # Read the file in chunks
+                        if not chunk:
+                            break
+                        
+                        chunk = chunk.strip()
+                        file_content += chunk
+                        chunk_tokens = len(encoding.encode(chunk, disallowed_special=()))
+                        
+                        # Add the chunk's token count to the total for this file
+                        file_tokens += chunk_tokens
+                        total_tokens += chunk_tokens
+                        
+                        # If total token limit is exceeded, stop processing further
+                        if total_tokens > token_limit:
+                            yield total_tokens, path, file_content
+                            return
+                        
+                # After processing the whole file, yield the total tokens, path, and content
+                if file_tokens > 0:  # Yield only if the file has tokens
+                    yield file_tokens, path, file_content
+
             except UnicodeDecodeError:
                 logger.error("Failed to read file %s", path)
                 if self.skip_unreadable:
                     continue
                 raise
-            if self.skip_empty and not content:
+
+            # Skip empty files if the option is enabled
+            if self.skip_empty and not file_content:
                 continue
-            tokens = len(encoding.encode(content, disallowed_special=()))
-            yield tokens, path, content
+
+
 
     def calculate_tokens(self, top: Path | None = None) -> int:
         """Calculate total number of tokens in all matching files"""
