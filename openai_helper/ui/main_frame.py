@@ -94,11 +94,7 @@ class ModelProviderBackgroundTask(BackgroundTask):
     def list_models(self, api_token: str):
         """List OpenAI models"""
         openai.api_key = api_token
-        return [
-            model["id"]
-            for model in openai.Model.list()["data"]
-            if str(model["root"]).startswith(("code-", "text-", "gpt-"))
-        ]
+        return ["gpt-4o-mini"]  # Only show the GPT-3.5 Turbo model
 
 
 class CompletionAPIBackgroundTask(BackgroundTask):
@@ -112,7 +108,7 @@ class CompletionAPIBackgroundTask(BackgroundTask):
         prompt: str = "",
         context_provider: ContextProvider | None = None,
         max_tokens: int = 500,
-        model: str = "davinci",
+        model: str = "gpt-4o-mini",  # Use GPT-3.5 Turbo model exclusively
     ):
         self.api_token = api_token
         self.prompt = prompt
@@ -134,6 +130,7 @@ class CompletionAPIBackgroundTask(BackgroundTask):
         )
 
 
+
 class ModelProviderThread(threading.Thread):
     """Provide OpenAI models"""
 
@@ -146,37 +143,52 @@ class ModelProviderThread(threading.Thread):
         """Provide OpenAI models"""
         openai.api_key = self.api_token
         try:
-            models = [
-                model["id"]
-                for model in openai.Model.list()["data"]
-                if str(model["root"]).startswith(("code-", "text-", "gpt-"))
-            ]
-            self.result_queue.put({"result": sorted(models)})
+            models = ["gpt-4o-mini"]  # Only show the GPT-3.5 Turbo model
+            self.result_queue.put({"result": models})
         except Exception as error:  # pylint: disable=broad-except
-            self.result_queue.put({"error": error})
-
+            self.result_queue.put({"error": str(error), "exception": error})
 
 class FileProviderThread(threading.Thread):
-    """Thread calculating file paths and their token length"""
+    """Thread calculating file paths and their token length in chunks"""
 
     def __init__(
         self,
         result_queue: queue.Queue,
         context_provider: ContextProvider,
+        chunk_size=1024,  # Default chunk size for reading files
+        token_limit=200000  # Set a limit to total tokens allowed
     ):
         super().__init__()
         self.result_queue = result_queue
         self.provider = context_provider
+        self.chunk_size = chunk_size
+        self.token_limit = token_limit
 
     def run(self):
-        """Calculate file paths and their token length"""
+        """Calculate file paths and their token length, respecting chunk size and token limit"""
         try:
-            result = [{"tokens": tokens, "path": path} for tokens, path, _ in self.provider.iter_files()]
+            # Initialize result storage and token counter
+            result = []
+            total_tokens = 0
+            
+            # Iterate over files and process them in chunks
+            for tokens, path, _ in self.provider.iter_files(chunk_size=self.chunk_size, token_limit=self.token_limit):
+                result.append({"tokens": tokens, "path": path})
+                
+                # Accumulate the total tokens
+                total_tokens += tokens
+
+                # If the total token limit is exceeded, stop further processing
+                if total_tokens > self.token_limit:
+                    print(f"Token limit exceeded: {total_tokens} tokens")
+                    break
+
+            # Send the result and total tokens back to the result queue
+            self.result_queue.put({"result": result, "total_tokens": total_tokens})
+
         except Exception as error:  # pylint: disable=broad-except
             self.result_queue.put({"error": "Unexpected error occurred", "exception": error})
-            return
-        total_tokens = sum(file["tokens"] for file in result)
-        self.result_queue.put({"result": result, "total_tokens": total_tokens})
+
 
 
 class CompletionDialog(tk.Toplevel):
@@ -212,6 +224,7 @@ class OpenAISettingsFrame(ttk.Labelframe):
         self.openai_api_token = tk.StringVar(value=self.root.root.configuration.openai_token or "")
         self.selected_model = tk.StringVar(value=self.root.root.configuration.openai_model or "")
         self.max_tokens = tk.StringVar(value=self.root.root.configuration.openai_max_tokens or "500")
+        
         ttk.Label(self, text="OpenAI API token:").grid(column=0, row=0, sticky="w", padx=5)
         ttk.Entry(self, textvariable=self.openai_api_token).grid(column=1, columnspan=5, row=0, sticky=("nsew"), padx=5)
 
@@ -223,7 +236,11 @@ class OpenAISettingsFrame(ttk.Labelframe):
         )
 
         ttk.Label(self, text="Max tokens:").grid(column=0, row=2, sticky="w", padx=5)
-        ttk.Entry(self, textvariable=self.max_tokens).grid(column=1, row=2, sticky=("nsew"), padx=5)
+        max_tokens_entry = ttk.Entry(self, textvariable=self.max_tokens)
+        max_tokens_entry.grid(column=1, row=2, sticky=("nsew"), padx=5)
+        
+        # Bind the validation method to changes in max_tokens
+        self.max_tokens.trace_add("write", self._trace_max_tokens)
 
         self.columnconfigure(1, weight=1)
         self.openai_api_token.trace_add(
@@ -236,12 +253,18 @@ class OpenAISettingsFrame(ttk.Labelframe):
             lambda *_: self.root.update_config("openai_model", self.selected_model.get()),
         )
 
-        self.max_tokens.trace_add("write", self._trace_max_tokens)
-
     def _trace_max_tokens(self, *_):
-        """Trace max tokens"""
-        self.max_tokens.set(str(self.root.extract_int(self.max_tokens.get())))
-        self.root.update_config("openai_max_tokens", self.max_tokens.get())
+        """Trace and validate max tokens input"""
+        try:
+            value = self.max_tokens.get()
+            # Extract integer from the string
+            value = int(re.sub(r"\D", "", value) or "0")
+            # Update the max_tokens entry if valid
+            self.max_tokens.set(value)
+            self.root.update_config("openai_max_tokens", value)
+        except ValueError:
+            # Handle invalid integer case, if necessary
+            self.max_tokens.set("500")  # Default value or handle as appropriate
 
     def refresh_models(self):
         """Refresh list of models"""
